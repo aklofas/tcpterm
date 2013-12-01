@@ -1,0 +1,84 @@
+#!/usr/bin/env python
+# TCP Terminal Utility - Andrew Klofas <andrew.klofas@gmail.com> - Dec 2008
+
+import argparse
+import socket, threading
+import sys, tty, termios
+import signal, errno, os
+
+
+# Quit code
+cmdQUIT = (0x18, "Ctrl-x")
+returnSTATUS = 0
+
+
+# Parse args
+p = argparse.ArgumentParser(description='Open a terminal over a raw tcp socket')
+p.add_argument('host', help='Specifies a host to contact over the network.')
+p.add_argument('port', type=int, help='Specifies a port number to contact.')
+a = p.parse_args()
+
+
+# Connect to server
+try:
+	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	s.connect((a.host, a.port))
+
+except socket.error as e:
+	sys.stderr.write("%s.\n" % (os.strerror(e.errno)))
+	sys.exit(e.errno)
+	
+
+# Read from socket and dump to stdout
+def read():
+	while True:
+		data = s.recv(1024)
+		if not data: break
+		sys.stdout.write(data)
+		sys.stdout.flush()
+
+
+# Start the read thread
+t = threading.Thread(target=read)
+t.daemon = True
+t.start()
+
+
+# Forward terminal control signals
+signal.signal(signal.SIGINT, lambda _1, _2: s.send(chr(0x03)))
+signal.signal(signal.SIGTSTP, lambda _1, _2: s.send(chr(0x1A)))
+signal.signal(signal.SIGQUIT, lambda _1, _2: s.send(chr(0x1C)))
+
+
+# Print header
+sys.stdout.write("> Welcome to TCPTerm. Press %s to quit.\n" % (cmdQUIT[1]))
+
+
+# Get 1 byte at a time from stdin
+old = termios.tcgetattr(sys.stdin)
+try:
+	tty.setcbreak(sys.stdin.fileno())
+
+	while True:
+		try:
+			c = sys.stdin.read(1)
+			if ord(c) == cmdQUIT[0]: break
+			s.send(c)
+
+		except IOError as e:
+			# Ignore if errno is one of these
+			if e.errno in [errno.EINTR]: continue
+			# Cleanly exit if errno is one of these
+			if e.errno in [errno.EPIPE]: break
+			
+			sys.stderr.write("%s.\n" % (os.strerror(e.errno)))
+			returnSTATUS = e.errno
+			break
+
+finally:
+	termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+
+# Close down
+s.close()
+sys.exit(returnSTATUS)
+

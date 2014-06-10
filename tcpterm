@@ -1,10 +1,8 @@
 #!/usr/bin/env python
 # TCP Terminal Utility - Andrew Klofas <andrew.klofas@gmail.com> - Dec 2008
 
-import argparse
-import socket, threading
-import sys, tty, termios
-import signal, errno, os
+import argparse, socket, sys, tty, termios, signal, errno, os
+from threading import Thread, Event
 
 
 # Quit code
@@ -14,6 +12,7 @@ returnSTATUS = 0
 
 # Parse args
 p = argparse.ArgumentParser(description='Open a terminal over a raw tcp socket')
+p.add_argument('--cmd', '-c', action='append', default=[], help='Commands to be executed at the beginning of the session')
 p.add_argument('host', help='Specifies a host to contact over the network.')
 p.add_argument('port', type=int, help='Specifies a port number to contact.')
 a = p.parse_args()
@@ -24,24 +23,52 @@ try:
 	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 	s.connect((a.host, a.port))
 
+	# Write commands list first
+	for c in a.cmd:
+		s.sendall(c + '\n')
+
 except socket.error as e:
 	sys.stderr.write("%s.\n" % (os.strerror(e.errno)))
 	sys.exit(e.errno)
 	
 
 # Read from socket and dump to stdout
-def read():
+def sock2stdout(qe):
 	while True:
 		data = s.recv(1024)
 		if not data: break
 		sys.stdout.write(data)
 		sys.stdout.flush()
 
+	# Flag the quit event
+	qe.set()
 
-# Start the read thread
-t = threading.Thread(target=read)
-t.daemon = True
-t.start()
+
+# Read from stdin and dump to socket
+def stdin2sock(qe):
+	while True:
+		try:
+			c = sys.stdin.read(1)
+			if ord(c) == cmdQUIT[0]: break
+			s.send(c)
+
+		except IOError as e:
+			# Ignore if errno is one of these
+			if e.errno in [errno.EINTR]: continue
+			# Cleanly exit if errno is one of these
+			if e.errno in [errno.EPIPE, errno.EBADF]: break
+
+			sys.stderr.write("%s.\n" % (os.strerror(e.errno)))
+			returnSTATUS = e.errno
+			break
+
+	# Flag the quit event
+	qe.set()
+
+
+eventQUIT = Event()
+stdoutTHREAD = Thread(target=sock2stdout, args=(eventQUIT,))
+stdinTHREAD = Thread(target=stdin2sock, args=(eventQUIT,))
 
 
 # Forward terminal control signals
@@ -59,21 +86,12 @@ old = termios.tcgetattr(sys.stdin)
 try:
 	tty.setcbreak(sys.stdin.fileno())
 
-	while True:
-		try:
-			c = sys.stdin.read(1)
-			if ord(c) == cmdQUIT[0]: break
-			s.send(c)
+	# Start the threads
+	stdoutTHREAD.start()
+	stdinTHREAD.start()
 
-		except IOError as e:
-			# Ignore if errno is one of these
-			if e.errno in [errno.EINTR]: continue
-			# Cleanly exit if errno is one of these
-			if e.errno in [errno.EPIPE]: break
-			
-			sys.stderr.write("%s.\n" % (os.strerror(e.errno)))
-			returnSTATUS = e.errno
-			break
+	# Wait for quit event
+	eventQUIT.wait()
 
 finally:
 	termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
